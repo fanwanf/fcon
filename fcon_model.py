@@ -173,7 +173,7 @@ class FCON(nn.Module):
         )
         return voxelized_roi_point_clouds
 
-    def predict(
+    def _compute_roi_features(
         self,
         rgb: torch.Tensor,
         intrinsic: torch.Tensor,
@@ -182,7 +182,9 @@ class FCON(nn.Module):
         masks: torch.Tensor,
         near_plane: torch.Tensor,
         far_plane: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+        perturb: bool = False,
+    ):
+        """Non-parallelizable stage: frustum setup, ROI align, voxelization."""
         device = rgb.device
 
         im_size = torch.tensor(rgb.shape[-2:], device=device)
@@ -194,7 +196,7 @@ class FCON(nn.Module):
             boxes,
             masks,
             im_size,
-            perturb=False,
+            perturb=perturb,
         )
         voxelized_roi_point_clouds = self._voxelize_roi_point_clouds(
             frustums, point_map
@@ -222,23 +224,34 @@ class FCON(nn.Module):
             output_size=(self.patch_size, self.patch_size),
             sampling_ratio=2,
         )
-        roi_feats = torch.cat(
-            [
-                rgb_p,
-                masks_p,
-                masks_p,
-            ],
-            dim=1,
-        )
+        roi_feats = torch.cat([rgb_p, masks_p, masks_p], dim=1)
 
         roi_voxelized_features = torch.einsum(
             "bdhw,bchw->bcdhw", voxelized_roi_point_clouds, roi_feats
         )
+        return roi_voxelized_features, grid_pts_cam
 
+    def forward(self, roi_voxelized_features: torch.Tensor) -> torch.Tensor:
+        """Parallelizable NN stage: 3D-UNet + 2D-UNet + predictor."""
         feats = self.feature_module(roi_voxelized_features).squeeze(1)
         feats = self.unet2d(feats)
-        logits = self.predictor(feats)
+        return self.predictor(feats)
 
+    def predict(
+        self,
+        rgb: torch.Tensor,
+        intrinsic: torch.Tensor,
+        point_map: torch.Tensor,
+        boxes: torch.Tensor,
+        masks: torch.Tensor,
+        near_plane: torch.Tensor,
+        far_plane: torch.Tensor,
+        perturb: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        roi_voxelized_features, grid_pts_cam = self._compute_roi_features(
+            rgb, intrinsic, point_map, boxes, masks, near_plane, far_plane, perturb=perturb,
+        )
+        logits = self(roi_voxelized_features)
         return {
             "logits": logits,
             "grid_centers": grid_pts_cam,
