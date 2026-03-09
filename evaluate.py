@@ -131,22 +131,30 @@ def evaluate_scene(model, scene_path, mesh_dir, device, n_pts=16384, obj_chunk=8
     scales       = torch.from_numpy(to_np(f["obj_poses"].item()["scales"])[keep]).float()
     extents      = torch.from_numpy(to_np(f["voxel_grid"].item()["extents"])[keep]).float()
 
-    rgb        = torch.from_numpy(to_np(f["rgb"])).float().to(device)
-    intrinsic  = torch.from_numpy(to_np(f["intrinsic"])).float().to(device)
-    depth_map  = torch.from_numpy(to_np(f["depth_map"])).float().to(device)
-    near_plane = torch.tensor(float(f["near_plane"])).to(device)
-    far_plane  = torch.tensor(float(f["far_plane"])).to(device)
-    boxes = torch.from_numpy(to_np(segm["boxes"])[keep]).float().to(device)
-    masks = torch.from_numpy(to_np(segm["masks"])[keep]).to(device)
+    rgb          = torch.from_numpy(to_np(f["rgb"])).float().to(device)
+    intrinsic    = torch.from_numpy(to_np(f["intrinsic"])).float().to(device)
+    depth_map    = torch.from_numpy(to_np(f["depth_map"])).float().to(device)
+    normal_map   = torch.from_numpy(to_np(f["normal_map"])).float().to(device)
+    near_plane   = torch.tensor(float(f["near_plane"])).to(device)
+    far_plane    = torch.tensor(float(f["far_plane"])).to(device)
+    boxes        = torch.from_numpy(to_np(segm["boxes"])[keep]).float().to(device)
+    masks        = torch.from_numpy(to_np(segm["masks"])[keep]).to(device)
+    amodal_masks = torch.from_numpy(to_np(segm["amodal_masks"])[keep]).to(device)
 
     # Rescale to target_scale=800 (same as training)
     h, w = rgb.shape[-2:]
     scale_factor = 800.0 / np.sqrt(h * w)
-    rgb       = F.interpolate(rgb[None], scale_factor=scale_factor, mode="bilinear", align_corners=False)[0]
-    intrinsic = intrinsic.clone(); intrinsic[0:2] *= scale_factor
-    depth_map = F.interpolate(depth_map[None, None], scale_factor=scale_factor, mode="nearest")[0, 0]
-    boxes     = boxes * scale_factor
-    masks     = F.interpolate(masks[:, None].byte(), scale_factor=scale_factor, mode="nearest")[:, 0].bool()
+    rgb          = F.interpolate(rgb[None], scale_factor=scale_factor, mode="bilinear", align_corners=False)[0]
+    intrinsic    = intrinsic.clone(); intrinsic[0:2] *= scale_factor
+    depth_map    = F.interpolate(depth_map[None, None], scale_factor=scale_factor, mode="nearest")[0, 0]
+    # Normals: bilinear resize then re-normalize per pixel to restore unit length
+    normal_map   = F.normalize(
+        F.interpolate(normal_map[None], scale_factor=scale_factor, mode="bilinear", align_corners=False)[0],
+        dim=0,
+    )
+    boxes        = boxes * scale_factor
+    masks        = F.interpolate(masks[:, None].byte(), scale_factor=scale_factor, mode="nearest")[:, 0].bool()
+    amodal_masks = F.interpolate(amodal_masks[:, None].byte(), scale_factor=scale_factor, mode="nearest")[:, 0].bool()
 
     point_map = depth2cloud(depth_map, intrinsic).permute(2, 0, 1)
 
@@ -160,7 +168,8 @@ def evaluate_scene(model, scene_path, mesh_dir, device, n_pts=16384, obj_chunk=8
         idx = slice(start, end)
 
         out = model.predict(rgb, intrinsic, point_map,
-                            boxes[idx], masks[idx], near_plane, far_plane)
+                            boxes[idx], masks[idx], amodal_masks[idx], normal_map,
+                            near_plane, far_plane)
         logits       = out["logits"].float()
         grid_centers = out["grid_centers"]
 

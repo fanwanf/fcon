@@ -33,6 +33,7 @@ class COB3D(torch.utils.data.Dataset):
             "rgb": f["rgb"],
             "intrinsic": f["intrinsic"],
             "depth_map": f["depth_map"],
+            "normal_map": f["normal_map"],   # (3, H, W) unit surface normals in camera space
             "boxes": segm["boxes"][keep_obj],
             "masks": segm["masks"][keep_obj],
             "amodal_masks": segm["amodal_masks"][keep_obj],
@@ -56,6 +57,16 @@ class COB3D(torch.utils.data.Dataset):
         item["depth_map"] = F.interpolate(
             item["depth_map"][None, None], scale_factor=scale_factor, mode="nearest"
         )[0, 0]
+        # Normals: bilinear resize then re-normalize per pixel to restore unit length
+        item["normal_map"] = F.normalize(
+            F.interpolate(
+                item["normal_map"][None],
+                scale_factor=scale_factor,
+                mode="bilinear",
+                align_corners=False,
+            )[0],
+            dim=0,  # normalize along channel dim (3,) at each spatial location
+        )
         item["boxes"] *= scale_factor
         item["masks"] = F.interpolate(
             item["masks"][:, None].byte(), scale_factor=scale_factor, mode="nearest"

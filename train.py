@@ -71,17 +71,19 @@ def list_collate(batch):
 
 def train_step(model, model_dp, batch, device, optimizer, scaler, obj_chunk=32):
     """Process one scene, chunking objects to bound peak GPU memory."""
-    rgb        = batch["rgb"].to(device)
-    intrinsic  = batch["intrinsic"].to(device)
-    depth_map  = batch["depth_map"].to(device)
-    boxes      = batch["boxes"].to(device)
-    masks      = batch["masks"].to(device)
-    near_plane = batch["near_plane"].to(device)
-    far_plane  = batch["far_plane"].to(device)
-    voxels     = batch["voxel_grid"]["voxels"].to(device)
-    extents    = batch["voxel_grid"]["extents"].to(device)
+    rgb          = batch["rgb"].to(device)
+    intrinsic    = batch["intrinsic"].to(device)
+    depth_map    = batch["depth_map"].to(device)
+    normal_map   = batch["normal_map"].to(device)
+    boxes        = batch["boxes"].to(device)
+    masks        = batch["masks"].to(device)
+    amodal_masks = batch["amodal_masks"].to(device)
+    near_plane   = batch["near_plane"].to(device)
+    far_plane    = batch["far_plane"].to(device)
+    voxels       = batch["voxel_grid"]["voxels"].to(device)
+    extents      = batch["voxel_grid"]["extents"].to(device)
     cam_from_obj = batch["obj_poses"]["poses"].to(device)
-    scales     = batch["obj_poses"]["scales"].to(device)
+    scales       = batch["obj_poses"]["scales"].to(device)
 
     n_objects = len(boxes)
     if n_objects == 0:
@@ -99,7 +101,8 @@ def train_step(model, model_dp, batch, device, optimizer, scaler, obj_chunk=32):
 
         roi_feats, grid_centers = model._compute_roi_features(
             rgb, intrinsic, point_map,
-            boxes[idx], masks[idx], near_plane, far_plane,
+            boxes[idx], masks[idx], amodal_masks[idx], normal_map,
+            near_plane, far_plane,
             perturb=True,
         )
 
@@ -141,22 +144,25 @@ def val_step(model, model_dp, scenes, device):
         if n_objects == 0:
             continue
 
-        rgb        = batch["rgb"].to(device)
-        intrinsic  = batch["intrinsic"].to(device)
-        depth_map  = batch["depth_map"].to(device)
-        boxes      = batch["boxes"].to(device)
-        masks      = batch["masks"].to(device)
-        near_plane = batch["near_plane"].to(device)
-        far_plane  = batch["far_plane"].to(device)
-        voxels     = batch["voxel_grid"]["voxels"].to(device)
-        extents    = batch["voxel_grid"]["extents"].to(device)
+        rgb          = batch["rgb"].to(device)
+        intrinsic    = batch["intrinsic"].to(device)
+        depth_map    = batch["depth_map"].to(device)
+        normal_map   = batch["normal_map"].to(device)
+        boxes        = batch["boxes"].to(device)
+        masks        = batch["masks"].to(device)
+        amodal_masks = batch["amodal_masks"].to(device)
+        near_plane   = batch["near_plane"].to(device)
+        far_plane    = batch["far_plane"].to(device)
+        voxels       = batch["voxel_grid"]["voxels"].to(device)
+        extents      = batch["voxel_grid"]["extents"].to(device)
         cam_from_obj = batch["obj_poses"]["poses"].to(device)
-        scales     = batch["obj_poses"]["scales"].to(device)
+        scales       = batch["obj_poses"]["scales"].to(device)
 
         point_map = depth2cloud(depth_map, intrinsic).permute(2, 0, 1)
 
         roi_feats, grid_centers = model._compute_roi_features(
-            rgb, intrinsic, point_map, boxes, masks, near_plane, far_plane,
+            rgb, intrinsic, point_map, boxes, masks, amodal_masks, normal_map,
+            near_plane, far_plane,
         )
         with torch.cuda.amp.autocast():
             logits = model_dp(roi_feats)
@@ -258,7 +264,8 @@ def main():
     )
     scaler = torch.cuda.amp.GradScaler()
 
-    ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
+    ckpt_dir  = os.path.dirname(os.path.abspath(args.checkpoint))
+    ckpt_stem = os.path.splitext(os.path.basename(args.checkpoint))[0]  # e.g. "fcon_v2"
     os.makedirs(ckpt_dir, exist_ok=True)
     best_val_iou = -1.0
 
@@ -321,13 +328,13 @@ def main():
         # Save best
         if val_iou > best_val_iou:
             best_val_iou = val_iou
-            best_path = os.path.join(ckpt_dir, "fcon_best.pt")
+            best_path = os.path.join(ckpt_dir, f"{ckpt_stem}_best.pt")
             torch.save(raw_model.state_dict(), best_path)
             print(f"  New best val IoU {val_iou:.4f} — saved to {best_path}")
 
         # Snapshot every 10 epochs
         if (epoch + 1) % 10 == 0:
-            snap_path = os.path.join(ckpt_dir, f"fcon_epoch{epoch+1:04d}.pt")
+            snap_path = os.path.join(ckpt_dir, f"{ckpt_stem}_epoch{epoch+1:04d}.pt")
             torch.save(raw_model.state_dict(), snap_path)
             print(f"  Epoch snapshot saved to {snap_path}")
 
