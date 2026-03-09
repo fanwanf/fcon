@@ -137,7 +137,7 @@ def train_step(model, model_dp, batch, device, optimizer, scaler, obj_chunk=32):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def val_step(model, model_dp, scenes, device):
+def val_step(model, model_dp, scenes, device, obj_chunk=32):
     ious = []
     for batch in scenes:
         n_objects = len(batch["boxes"])
@@ -160,19 +160,30 @@ def val_step(model, model_dp, scenes, device):
 
         point_map = depth2cloud(depth_map, intrinsic).permute(2, 0, 1)
 
-        roi_feats, grid_centers = model._compute_roi_features(
-            rgb, intrinsic, point_map, boxes, masks, amodal_masks, normal_map,
-            near_plane, far_plane,
-        )
-        with torch.cuda.amp.autocast():
-            logits = model_dp(roi_feats)
+        inter_total = torch.tensor(0.0, device=device)
+        union_total = torch.tensor(0.0, device=device)
 
-        gt_occ   = compute_gt_occupancy(grid_centers, cam_from_obj, scales, extents, voxels)
-        pred_occ = logits.float().sigmoid() > 0.5
+        for start in range(0, n_objects, obj_chunk):
+            end = min(start + obj_chunk, n_objects)
+            idx = slice(start, end)
 
-        inter = (pred_occ & gt_occ.bool()).float().sum()
-        union = (pred_occ | gt_occ.bool()).float().sum()
-        ious.append((inter / union.clamp(min=1e-6)).item())
+            roi_feats, grid_centers = model._compute_roi_features(
+                rgb, intrinsic, point_map,
+                boxes[idx], masks[idx], amodal_masks[idx], normal_map,
+                near_plane, far_plane,
+            )
+            with torch.cuda.amp.autocast():
+                logits = model_dp(roi_feats)
+
+            gt_occ   = compute_gt_occupancy(
+                grid_centers, cam_from_obj[idx], scales[idx], extents[idx], voxels[idx]
+            )
+            pred_occ = logits.float().sigmoid() > 0.5
+
+            inter_total += (pred_occ & gt_occ.bool()).float().sum()
+            union_total += (pred_occ | gt_occ.bool()).float().sum()
+
+        ious.append((inter_total / union_total.clamp(min=1e-6)).item())
 
     return sum(ious) / len(ious) if ious else None
 
