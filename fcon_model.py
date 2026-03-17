@@ -154,15 +154,17 @@ class FCON(nn.Module):
         near_plane_offset = 0.05
         far_plane_offset = 0.0
         if perturb:
-            near_plane_offset = (
-                torch.randn_like(near_planes)
-                .mul(0.1)
-                .add(near_plane_offset)
-                .clip(0.05, 0.2)
-            )
-            far_plane_offset = (
-                torch.rand_like(far_planes).sub(0.5).mul(0.2)
-            )  # [-0.1, 0.1]
+            # TODO-7: Wide depth-range randomization.
+            # Forces the model to infer box depth from background/normal evidence
+            # rather than reading it implicitly from the frustum range.
+            # COB3D far_plane is always ~floor depth, so without this the model
+            # can cheat: box_height ≈ far_plane - near_plane.
+            #
+            # near: push 5–35 cm above the closest visible point (uniform)
+            # far:  push 0–50 cm past the floor/conveyor surface (uniform)
+            near_plane_offset = torch.rand_like(near_planes).mul(0.30).add(0.05)  # [0.05, 0.35]
+            far_plane_offset = -torch.rand_like(far_planes).mul(0.50)             # [-0.50, 0.0]
+            # net: far_planes -= far_plane_offset  →  far_planes += [0, 0.50]
 
         near_planes = near_planes - near_plane_offset
         far_planes = far_planes - far_plane_offset

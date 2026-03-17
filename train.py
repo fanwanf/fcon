@@ -25,6 +25,31 @@ from torch_utils import depth2cloud, to_torch, transform_points
 
 
 # ---------------------------------------------------------------------------
+# Loss functions
+# ---------------------------------------------------------------------------
+
+def focal_loss(logits: torch.Tensor, targets: torch.Tensor,
+               pos_weight: torch.Tensor = None, gamma: float = 2.0) -> torch.Tensor:
+    """Binary focal loss with optional positive-class weighting (TODO-8).
+
+    FL = -(1 - p_t)^gamma * BCE
+
+    The focal factor (1 - p_t)^gamma down-weights easy predictions (voxels the
+    model is already very confident about) and up-weights hard ones.  With ~95%
+    of frustum voxels empty, standard BCE is dominated by easy empty-voxel loss
+    terms; focal loss suppresses these so the model focuses on correctly
+    predicting occupied voxels — critical for solid, gap-free box predictions.
+    """
+    bce = F.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none", pos_weight=pos_weight
+    )
+    with torch.no_grad():
+        p_t = torch.where(targets.bool(), logits.sigmoid(), 1.0 - logits.sigmoid())
+        focal_weight = (1.0 - p_t).pow(gamma)
+    return (focal_weight * bce).mean()
+
+
+# ---------------------------------------------------------------------------
 # GT occupancy helper
 # ---------------------------------------------------------------------------
 
@@ -116,9 +141,7 @@ def train_step(model, model_dp, batch, device, optimizer, scaler, obj_chunk=32):
         pos_weight = (1.0 - pos_frac) / pos_frac
 
         with torch.cuda.amp.autocast():
-            chunk_loss = F.binary_cross_entropy_with_logits(
-                logits, gt_occ, pos_weight=pos_weight
-            )
+            chunk_loss = focal_loss(logits, gt_occ, pos_weight=pos_weight)
 
         scaler.scale(chunk_loss).backward()
         total_loss = total_loss + chunk_loss.detach()

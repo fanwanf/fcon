@@ -21,10 +21,37 @@ import torch.nn.functional as F
 import trimesh
 from pytorch3d.ops.marching_cubes import marching_cubes
 from pytorch3d.ops import knn_points
+from scipy.ndimage import label as scipy_label
 
 from cob3d_dataset import COB3D
 from fcon_model import FCON
 from torch_utils import depth2cloud, interp3d, to_np, to_torch, transform_points
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: largest connected component
+# ---------------------------------------------------------------------------
+
+def largest_connected_component(occ_vol: np.ndarray) -> np.ndarray:
+    """Keep only the largest connected component in a binary 3D volume.
+
+    Removes floating fragments that would produce spurious predicted surfaces
+    and inflate bounding-box estimates.
+    """
+    labeled, n = scipy_label(occ_vol)
+    if n <= 1:
+        return occ_vol
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0  # ignore background label (label 0 = empty)
+    return (labeled == sizes.argmax()).astype(occ_vol.dtype)
+
+
+def apply_lcc(probs: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+    """Binarize a (N, D, H, W) probability volume, apply LCC per object, return float tensor."""
+    binary = (probs > threshold).cpu().numpy()
+    for i in range(binary.shape[0]):
+        binary[i] = largest_connected_component(binary[i])
+    return torch.from_numpy(binary.astype(np.float32)).to(probs.device)
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +201,9 @@ def evaluate_scene(model, scene_path, mesh_dir, device, n_pts=16384, obj_chunk=8
         grid_centers = out["grid_centers"]
 
         probs = logits.sigmoid()
-        verts_idx_lst, faces_lst = marching_cubes(probs, 0.5, return_local_coords=False)
+        # LCC filter: drop floating fragments before marching cubes (TODO-9)
+        probs_filtered = apply_lcc(probs, threshold=0.5)
+        verts_idx_lst, faces_lst = marching_cubes(probs_filtered, 0.5, return_local_coords=False)
 
         cam_from_obj_b = cam_from_obj[idx].to(device)
         scales_b       = scales[idx].to(device)

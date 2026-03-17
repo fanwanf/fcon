@@ -209,15 +209,86 @@ Architecture:
 
 ---
 
+### TIER 1 — Confirmed fixes from training + evaluation (implement before next retrain)
+
+#### TODO-6: Increase resolution — n_depth_bins 96→192, patch_size 64→96 ✅ CONFIRMED NEEDED
+**File**: `fcon_model.py`, `train.py`, `fcon_model_v1.py`
+**Effort**: ~1 hour (config change) | **Expected gain**: high (current res ~3-6mm, target ~2mm)
+
+- Change `n_depth_bins=96` → `192` in model construction and all callers
+- Change `patch_size=64` → `96` in model construction and all callers
+- First ConvLayer in `feature_module` input channels unchanged (15 for v2, 5 for v1)
+- **Memory impact**: 3D feature volume grows from (N,15,96,64,64) → (N,15,192,96,96), roughly 6× larger
+  - With obj_chunk=32 and AMP fp16, this is ~18 GB per GPU on L4 — may need to reduce obj_chunk to 16
+- **Why confirmed**: Current depth bin width = frustum_range/96 ≈ 3-5mm. Spatial patch = object_size/64 ≈ 2-6mm.
+  Both are too coarse for 2mm accuracy targets. Doubling both dims brings worst-case to ~2mm.
+
+#### TODO-7: Depth range randomization during training ✅ CONFIRMED NEEDED
+**File**: `train.py` (`train_step`), `fcon_model.py` (`_get_frustums`)
+**Effort**: ~2 hours | **Expected gain**: high (prevents frustum-range "cheat")
+
+**The bug found**: `far_plane` in COB3D is set to ~floor/conveyor depth (within 1-8cm). This means
+even without background channels, the old model can implicitly read box height from `far_plane - near_plane`.
+Ablation on synthetic data confirmed: old model CD-L2 degraded +193% with randomized far_plane vs +132% for new model.
+
+**Fix**: During training, add random cushion to near and far planes per-object:
+```python
+# In train_step, before calling model.predict():
+cushion_top    = torch.rand(n_obj, device=dev).mul(0.30)  # 0–30cm above box top
+cushion_bottom = torch.rand(n_obj, device=dev).mul(0.50)  # 0–50cm past floor
+# Pass these as near_plane_offset / far_plane_offset args into _get_frustums()
+# (Currently _get_frustums uses a fixed 5cm near offset; make it a per-object random tensor)
+```
+At inference time, keep the original fixed 5cm near offset and actual scene far_plane.
+This forces the model to infer box depth from background/normal evidence, not frustum range.
+
+---
+
+### TIER 1 — Selected for production bin-packing accuracy
+
+#### TODO-8: Focal loss for voxel class imbalance ✅ IMPLEMENTED
+**File**: `train.py` (`train_step`)
+**Effort**: done | **Status**: in production code
+
+- ~95% of frustum voxels are empty → BCE biases the model toward predicting empty everywhere
+- Focal loss `FL = -(1-p_t)^γ * BCE`, γ=2: down-weights easy empty-voxel predictions, improving occupied recall
+- Applied with the existing `pos_weight` so positive-class imbalance is handled at both levels
+- **Why for bin-packing**: under-filled predictions leave gaps in the predicted box interior → robot assumes free space that is actually occupied → collision during placement
+
+#### TODO-9: Largest connected component filter ✅ IMPLEMENTED
+**File**: `evaluate.py` (`evaluate_scene`)
+**Effort**: done | **Status**: in production code
+
+- After `probs = logits.sigmoid()`, binarize at 0.5 and run `scipy.ndimage.label` on each object's 3D volume
+- Keep only the single largest connected blob; set all other voxels to 0 before marching cubes
+- No retraining required — pure post-processing
+- **Why for bin-packing**: floating voxel fragments produce spurious predicted surfaces that inflate bounding-box estimates and cause false collision detections
+
+#### TODO-10: Separate near/far surface heads (replace per-voxel binary occupancy)
+**File**: `fcon_model.py` (new output heads), `train.py` (new loss)
+**Effort**: 3-5 days | **Expected gain**: highest for box accuracy (solid output by construction)
+
+- Current: per-voxel binary occupancy (N, D, H, W) → marching cubes
+- Replace predictor with two heads per spatial location (H, W):
+  - `near_surface_head` → predicted depth bin of the top/front surface (softmax over D)
+  - `far_surface_head`  → predicted depth bin of the bottom/back surface (softmax over D)
+- Occupancy is then filled solid between the two predicted surfaces — boxes are **always** connected by construction
+- Train with cross-entropy loss against GT surface bin indices (derived from GT occupancy boundary)
+- **Why for bin-packing**: eliminates floating voxels and interior holes architecturally, not via post-processing. The output is always a valid solid box shape.
+
+---
+
 ## Implementation Order (recommended)
 
 ```
-TODO-1 (normals + amodal)  →  retrain 125 epochs  →  evaluate
-TODO-2 (bg depth voxels)   →  retrain  →  evaluate (ablation vs TODO-1)
-TODO-1 + TODO-2 combined   →  retrain  →  evaluate
-TODO-3 (global encoder)    →  retrain  →  evaluate (biggest expected jump)
-TODO-4 (support plane)     →  retrain  →  evaluate
-TODO-5 (cross-attention)   →  retrain  →  evaluate
+TODO-9 (LCC filter)        →  no retrain, already in evaluate.py
+TODO-7 (depth range rand)  →  enhanced perturbation, already in fcon_model.py
+TODO-8 (focal loss)        →  already in train.py
+
+TODO-1 + TODO-2 + TODO-7 + TODO-8 combined  →  retrain 125 epochs  →  evaluate Box-IoU/F1
+TODO-4 (support plane)     →  add support_plane.py + FiLM conditioning  →  retrain  →  evaluate
+TODO-10 (near/far heads)   →  replace predictor head  →  retrain  →  evaluate
+TODO-3 (global encoder)    →  add scene_encoder.py + ROI inject  →  retrain  →  evaluate
 ```
 
 Run each ablation using `evaluate.py --n_scenes 100` for fast iteration before full 696-scene eval.
@@ -239,14 +310,14 @@ Run each ablation using `evaluate.py --n_scenes 100` for fast iteration before f
 ## Training Commands
 
 ```bash
-# Full 125-epoch training (paper config, 8 GPUs)
-conda activate fcon
+# Full 125-epoch training with all fixes (TODO-6 + TODO-7 + TODO-1 + TODO-2)
 nohup /home/fanwanf/miniconda3/envs/fcon/bin/python train.py \
     --data_root /tmp/cob3d/v2 --epochs 125 --lr 1e-3 \
-    --checkpoint checkpoints/fcon.pt > /tmp/train.log 2>&1 &
+    --checkpoint checkpoints/fcon_v2.pt > /tmp/train.log 2>&1 &
 
 # Resume from checkpoint
 nohup /home/fanwanf/miniconda3/envs/fcon/bin/python train.py \
     --data_root /tmp/cob3d/v2 --epochs 125 --lr 1e-3 \
-    --resume checkpoints/fcon.pt --checkpoint checkpoints/fcon.pt > /tmp/train.log 2>&1 &
+    --resume checkpoints/fcon_v2_best.pt --checkpoint checkpoints/fcon_v2.pt > /tmp/train.log 2>&1 &
 ```
+
