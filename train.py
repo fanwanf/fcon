@@ -200,6 +200,10 @@ def main():
     parser.add_argument("--resume",      default=None,
                         help="Path to an existing checkpoint to resume from")
     parser.add_argument("--epochs",      type=int,   default=125)
+    parser.add_argument("--start_epoch", type=int,   default=0,
+                        help="For old-format checkpoints (weights only): treat this as the "
+                             "epoch already trained, so the cosine LR schedule resumes from "
+                             "the correct position instead of restarting from 0.")
     parser.add_argument("--lr",          type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int,   default=4,
                         help="DataLoader workers for prefetching")
@@ -226,11 +230,19 @@ def main():
 
     # ---- Model ----
     model = FCON(n_depth_bins=96, patch_size=64).to(device)
+    resume_ckpt = None
 
     if args.resume:
         print(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(ckpt)
+        resume_ckpt = torch.load(args.resume, map_location="cpu")
+        # Support both old format (bare state_dict) and new format (dict with keys)
+        if isinstance(resume_ckpt, dict) and "model" in resume_ckpt:
+            model.load_state_dict(resume_ckpt["model"])
+        else:
+            model.load_state_dict(resume_ckpt)
+            resume_ckpt = None  # old format — no scheduler/optimizer state to restore
+            if args.start_epoch > 0:
+                print(f"  Old-format checkpoint: will fast-forward scheduler to epoch {args.start_epoch}.")
     elif not args.val_only:
         print("Training from scratch.")
 
@@ -275,10 +287,28 @@ def main():
     )
     scaler = torch.cuda.amp.GradScaler()
 
+    start_epoch  = 0
+    best_val_iou = -1.0
+
+    if resume_ckpt is not None:
+        optimizer.load_state_dict(resume_ckpt["optimizer"])
+        scheduler.load_state_dict(resume_ckpt["scheduler"])
+        scaler.load_state_dict(resume_ckpt["scaler"])
+        start_epoch  = resume_ckpt["epoch"] + 1
+        best_val_iou = resume_ckpt.get("best_val_iou", -1.0)
+        print(f"  Resuming from epoch {start_epoch}, best val IoU so far: {best_val_iou:.4f}")
+    elif args.start_epoch > 0:
+        # Old-format checkpoint loaded (weights only) — fast-forward the cosine scheduler
+        # so LR picks up at the right point rather than restarting from lr_max.
+        start_epoch = args.start_epoch
+        for _ in range(args.start_epoch):
+            scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"  Fast-forwarded scheduler {args.start_epoch} steps → LR = {current_lr:.6f}")
+
     ckpt_dir  = os.path.dirname(os.path.abspath(args.checkpoint))
     ckpt_stem = os.path.splitext(os.path.basename(args.checkpoint))[0]  # e.g. "fcon_v2"
     os.makedirs(ckpt_dir, exist_ok=True)
-    best_val_iou = -1.0
 
     train_dset   = SceneDataset(dset, train_ids)
     train_loader = DataLoader(
@@ -291,7 +321,7 @@ def main():
         persistent_workers=use_persistent,
     )
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         losses, skipped = [], 0
         t0 = time.time()
@@ -329,24 +359,35 @@ def main():
             f"lr={scheduler.get_last_lr()[0]:.6f}  skipped={skipped}"
         )
 
-        # Save latest
         # Unwrap compiled/DataParallel model for saving
         raw_model = model_dp.module if hasattr(model_dp, "module") else model_dp
         raw_model = getattr(raw_model, "_orig_mod", raw_model)  # unwrap torch.compile
-        torch.save(raw_model.state_dict(), args.checkpoint)
+
+        full_ckpt = {
+            "model":        raw_model.state_dict(),
+            "optimizer":    optimizer.state_dict(),
+            "scheduler":    scheduler.state_dict(),
+            "scaler":       scaler.state_dict(),
+            "epoch":        epoch,
+            "best_val_iou": best_val_iou,
+        }
+
+        # Save latest
+        torch.save(full_ckpt, args.checkpoint)
         print(f"  Checkpoint saved to {args.checkpoint}")
 
         # Save best
         if val_iou > best_val_iou:
             best_val_iou = val_iou
+            full_ckpt["best_val_iou"] = best_val_iou
             best_path = os.path.join(ckpt_dir, f"{ckpt_stem}_best.pt")
-            torch.save(raw_model.state_dict(), best_path)
+            torch.save(full_ckpt, best_path)
             print(f"  New best val IoU {val_iou:.4f} — saved to {best_path}")
 
         # Snapshot every 10 epochs
         if (epoch + 1) % 10 == 0:
             snap_path = os.path.join(ckpt_dir, f"{ckpt_stem}_epoch{epoch+1:04d}.pt")
-            torch.save(raw_model.state_dict(), snap_path)
+            torch.save(full_ckpt, snap_path)
             print(f"  Epoch snapshot saved to {snap_path}")
 
     print("Training complete.")
